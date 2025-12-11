@@ -18,10 +18,17 @@ all_analyses = []  # collect per-file analyses here
 
 for match_id in match_ids:
     endpoints = [
-        f"{API}/{match_id}/your-match",
-        f"{API}/{match_id}",
-        f"{API}/{match_id}/opening-duels",
-        f"{API}/{match_id}/clutches",
+        f"{API}/{match_id}/your-match", 
+        f"{API}/{match_id}", 
+        f"{API}/{match_id}/opening-duels", 
+        f"{API}/{match_id}/clutches", 
+        f"{API}/{match_id}/timelines/kills", 
+        f"{API}/{match_id}/timelines/deaths", 
+        f"{API}/{match_id}/timelines/damage", 
+        f"{API}/{match_id}/timelines/awp-kills", 
+        f"{API}/{match_id}/timelines/enemies-flashed", 
+        f"{API}/{match_id}/timelines/round-difference", 
+        f"{API}/{match_id}/timelines/team-economy",
     ]
 
     match_folder = os.path.join("leetify", match_id)
@@ -34,6 +41,12 @@ for match_id in match_ids:
             filename = api_path.replace("/", "_").strip("_") + ".json"
             filepath = os.path.join(match_folder, filename)
 
+            # --- Skip if file already exists ---
+            if os.path.exists(filepath):
+                print(f"Skipping {filepath}, already exists.")
+                continue
+
+            # Save JSON file
             with open(filepath, "w") as f:
                 json.dump(r.json(), f, indent=4)
 
