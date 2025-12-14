@@ -1,87 +1,291 @@
+import os
 import json
 import requests
-import os
-import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+# ============================================================
+# CONFIG
+# ============================================================
 API = "https://api.cs-prod.leetify.com/api/games"
-TOKEN = "USER_TOKEN"
+HISTORY_URL = "https://api.cs-prod.leetify.com/api/v2/games/history"
 
-headers = {"Authorization": f"Bearer {TOKEN}"}
+LEETIFY_TOKEN = "PUT_YOUR_TOKEN_HERE"
 
-tURL = "https://api.cs-prod.leetify.com/api/v2/games/history"
-t = requests.get(tURL, headers=headers)
-data = t.json()
+BASE_DIR = "leetify"
+MAX_WORKERS = 3   # SAFE for Leetify
 
-match_ids = [game.get("id") for game in data.get("games", []) if "id" in game]
+HEADERS = {
+    "Authorization": f"Bearer {LEETIFY_TOKEN}"
+}
 
-all_analyses = []  # collect per-file analyses here
+# ============================================================
+# LOCAL LLM CONFIG (OLLAMA)
+# ============================================================
+OLLAMA_MODEL = "llama3.1:8b"
+OLLAMA_URL = "http://localhost:11434/api/generate"
 
-for match_id in match_ids:
-    endpoints = [
-        f"{API}/{match_id}/your-match", 
-        f"{API}/{match_id}", 
-        f"{API}/{match_id}/opening-duels", 
-        f"{API}/{match_id}/clutches", 
-        f"{API}/{match_id}/timelines/kills", 
-        f"{API}/{match_id}/timelines/deaths", 
-        f"{API}/{match_id}/timelines/damage", 
-        f"{API}/{match_id}/timelines/awp-kills", 
-        f"{API}/{match_id}/timelines/enemies-flashed", 
-        f"{API}/{match_id}/timelines/round-difference", 
-        f"{API}/{match_id}/timelines/team-economy",
-    ]
+LLM_MATCH_PROMPT = """
+You are a CS2 performance analyst.
 
-    match_folder = os.path.join("leetify", match_id)
-    os.makedirs(match_folder, exist_ok=True)
+Analyze the following match report.
+Focus on:
+- Player consistency
+- Strengths and weaknesses
+- Impact rounds
+- Tactical or economic patterns
 
-    for url in endpoints:
-        r = requests.get(url, headers=headers)
-        if r.status_code == 200:
-            api_path = url[url.find("/api/"):]
-            filename = api_path.replace("/", "_").strip("_") + ".json"
-            filepath = os.path.join(match_folder, filename)
+Be concise but insightful.
+"""
 
-            # --- Skip if file already exists ---
-            if os.path.exists(filepath):
-                print(f"Skipping {filepath}, already exists.")
-                continue
+LLM_GLOBAL_PROMPT = """
+You are a CS2 analyst.
 
-            # Save JSON file
-            with open(filepath, "w") as f:
-                json.dump(r.json(), f, indent=4)
+Given multiple match analyses, provide:
+- Overall trends
+- Repeating strengths
+- Repeating weaknesses
+- Suggested improvement focus areas
 
-            # --- Analyze with local LLM ---
-            with open(filepath) as f:
-                content = f.read()
+Summarize clearly.
+"""
 
-            prompt = f"Analyze this CS2 match JSON and summarize key player performance:\n\n{content}"
-            result = subprocess.run(
-                ["ollama", "run", "llama2"],
-                input=prompt.encode("utf-8"),
-                capture_output=True
-            )
-            analysis = result.stdout.decode("utf-8")
+# ============================================================
+# SESSION (retry + backoff)
+# ============================================================
+session = requests.Session()
+session.headers.update(HEADERS)
 
-            # Save analysis per file
-            analysis_file = filepath.replace(".json", "_analysis.txt")
-            with open(analysis_file, "w") as f:
-                f.write(analysis)
-
-            # Collect for global summary
-            all_analyses.append(f"{filename}:\n{analysis}\n")
-
-# --- Global summary step ---
-global_prompt = "Create a global summary of these individual match analyses:\n\n" + "\n\n".join(all_analyses)
-
-global_result = subprocess.run(
-    ["ollama", "run", "llama2"],
-    input=global_prompt.encode("utf-8"),
-    capture_output=True
+retry = Retry(
+    total=5,
+    backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
 )
-global_summary = global_result.stdout.decode("utf-8")
 
-# Save global summary
-with open("leetify/global_summary.txt", "w") as f:
+adapter = HTTPAdapter(max_retries=retry)
+session.mount("https://", adapter)
+
+# ============================================================
+# LOCAL LLM CALL
+# ============================================================
+def run_local_llm(prompt, content):
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": f"{prompt}\n\n{content}",
+        "stream": False,
+    }
+
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=180)
+        r.raise_for_status()
+        return r.json().get("response", "").strip()
+    except requests.RequestException as e:
+        return f"LLM ERROR: {e}"
+
+# ============================================================
+# FORMATTERS
+# ============================================================
+def section(title):
+    return f"\n{'=' * 8} {title.upper()} {'=' * 8}\n"
+
+def format_clutches(data):
+    lines = []
+    for c in data:
+        handicap = abs(c["handicap"]) + 1
+        result = "WON" if c["clutchesWon"] else "LOST"
+        trade = " | Trade start" if c.get("startedWithTrade") else ""
+        lines.append(
+            f"Round {c['roundNumber']} | Team {c['teamNumber']} | "
+            f"Steam {c['steam64Id']} | 1v{handicap} | "
+            f"{result} | Kills {c['totalKills']}{trade}"
+        )
+    return "\n".join(lines)
+
+def format_opening_duels(data):
+    lines = []
+    for e in data:
+        t = f"{e['roundTime']//60}:{e['roundTime']%60:02d}"
+        traded = "Traded" if e.get("traded") else "Not traded"
+        weapon = e.get("attackerWeapon", {}).get("itemName", "Unknown")
+        lines.append(
+            f"Round {e['round']} @ {t} | "
+            f"{e['attackerName']} vs {e['victimName']} | "
+            f"{weapon} | {traded}"
+        )
+    return "\n".join(lines)
+
+def timeline(players, label, delta_label):
+    lines = [label]
+    for p in players:
+        lines.append(f"{p['name']} ({p['steam64Id']})")
+        prev = 0
+        for r, v in sorted((int(r), v) for r, v in p["rounds"].items()):
+            if v > prev:
+                lines.append(f"  Round {r}: {v-prev} {delta_label}")
+            prev = v
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+def format_kills_timeline(d): return timeline(d["players"], "Kills Timeline", "kill(s)")
+def format_deaths_timeline(d): return timeline(d["players"], "Deaths Timeline", "death")
+def format_damage_timeline(d): return timeline(d["players"], "Damage Timeline", "damage")
+def format_enemies_flashed_timeline(d): return timeline(d["players"], "Enemies Flashed", "enemy(s)")
+
+def format_awp_kills(d):
+    lines = ["AWP Kills Timeline"]
+    for p in d.get("players", []):
+        prev = 0
+        lines.append(f"{p['name']} ({p['steam64Id']})")
+        for r, v in sorted((int(r), v) for r, v in p["rounds"].items()):
+            if v > prev:
+                lines.append(f"  Round {r}: +{v-prev} (total {v})")
+            prev = v
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+def format_round_difference_timeline(d):
+    lines = ["Round Difference Timeline"]
+    for t in d.get("teams", []):
+        lines.append(f"Team {t['initialTeamNumber']}")
+        prev = 0
+        for r, diff in sorted((int(r), v) for r, v in t["rounds"].items()):
+            outcome = "WON" if diff > prev else "LOST" if diff < prev else "NO CHANGE"
+            lines.append(f"  Round {r}: {outcome} (diff {diff})")
+            prev = diff
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+def format_team_economy_timeline(d):
+    lines = ["Team Economy Timeline"]
+    for t in d.get("teams", []):
+        lines.append(f"Team {t['initialTeamNumber']}")
+        prev = None
+        for r, money in sorted((int(r), v) for r, v in t["rounds"].items()):
+            delta = "—" if prev is None else f"{money-prev:+}"
+            buy = (
+                "ECO" if money < 10000 else
+                "FORCE" if money < 20000 else
+                "HALF" if money < 30000 else
+                "FULL"
+            )
+            lines.append(f"  Round {r}: ${money} | {buy} | Δ {delta}")
+            prev = money
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+def format_your_match(d):
+    lines = [
+        f"Steam64: {d.get('steam64Id')}",
+        f"Tracked Matches: {d.get('recentMatchCount')}",
+        ""
+    ]
+    for stat in d.get("identityStats", []):
+        lines.append(f"{stat['skillId']}: {stat['value']} (avg {round(stat['average'],3)})")
+    return "\n".join(lines)
+
+# ============================================================
+# ENDPOINT REGISTRY
+# ============================================================
+ENDPOINTS = [
+    ("Your Match Summary", "/your-match", format_your_match, dict),
+    ("Opening Duels", "/opening-duels", format_opening_duels, list),
+    ("Clutches", "/clutches", format_clutches, list),
+    ("Kills Timeline", "/timelines/kills", format_kills_timeline, dict),
+    ("Deaths Timeline", "/timelines/deaths", format_deaths_timeline, dict),
+    ("Damage Timeline", "/timelines/damage", format_damage_timeline, dict),
+    ("AWP Kills", "/timelines/awp-kills", format_awp_kills, dict),
+    ("Enemies Flashed", "/timelines/enemies-flashed", format_enemies_flashed_timeline, dict),
+    ("Round Difference", "/timelines/round-difference", format_round_difference_timeline, dict),
+    ("Team Economy", "/timelines/team-economy", format_team_economy_timeline, dict),
+]
+
+# ============================================================
+# BUILD MATCH REPORT + LLM ANALYSIS
+# ============================================================
+def build_match_report(match_id):
+    report = [f"MATCH ID: {match_id}\n"]
+
+    for title, suffix, formatter, expected in ENDPOINTS:
+        url = f"{API}/{match_id}{suffix}"
+
+        try:
+            r = session.get(url, timeout=(5, 20))
+        except requests.RequestException as e:
+            report.append(section(title))
+            report.append(f"Request failed: {e}\n")
+            continue
+
+        if r.status_code != 200:
+            report.append(section(title))
+            report.append(f"HTTP {r.status_code}\n")
+            continue
+
+        try:
+            data = r.json()
+        except ValueError:
+            report.append(section(title))
+            report.append("Invalid JSON\n")
+            continue
+
+        if not isinstance(data, expected):
+            report.append(section(title))
+            report.append("Unexpected data format\n")
+            continue
+
+        report.append(section(title))
+        report.append(formatter(data))
+        report.append("")
+
+    match_dir = os.path.join(BASE_DIR, match_id)
+    os.makedirs(match_dir, exist_ok=True)
+
+    report_path = os.path.join(match_dir, "match_report.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(report).rstrip())
+
+    # ==========================
+    # PER-MATCH LOCAL LLM
+    # ==========================
+    with open(report_path, "r", encoding="utf-8") as f:
+        report_text = f.read()
+
+    llm_analysis = run_local_llm(LLM_MATCH_PROMPT, report_text)
+
+    with open(os.path.join(match_dir, "llm_analysis.txt"), "w", encoding="utf-8") as f:
+        f.write(llm_analysis)
+
+    return f"✅ {match_id}"
+
+# ============================================================
+# MAIN
+# ============================================================
+history = session.get(HISTORY_URL, timeout=10).json()
+match_ids = [g["id"] for g in history.get("games", [])]
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    futures = [pool.submit(build_match_report, mid) for mid in match_ids]
+    for f in as_completed(futures):
+        print(f.result())
+
+# ============================================================
+# GLOBAL LLM SUMMARY
+# ============================================================
+all_llm_reports = []
+
+for mid in match_ids:
+    path = os.path.join(BASE_DIR, mid, "llm_analysis.txt")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            all_llm_reports.append(f"Match {mid}:\n{f.read()}")
+
+global_summary = run_local_llm(
+    LLM_GLOBAL_PROMPT,
+    "\n\n".join(all_llm_reports)
+)
+
+with open(os.path.join(BASE_DIR, "GLOBAL_LLM_SUMMARY.txt"), "w", encoding="utf-8") as f:
     f.write(global_summary)
 
-print("Done with global analysis!")
+print("🚀 All match reports and LLM summaries generated")
